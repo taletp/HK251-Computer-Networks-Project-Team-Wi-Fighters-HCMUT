@@ -1,1 +1,687 @@
+# **DDoS Detection System (PyTorch + Streaming Aggregation)**
+
+## **1. Overview**
+Dự án này xây dựng một pipeline để phát hiện tấn công DDoS dựa trên log mạng (NetFlow / traffic features). Quy trình gồm ba giai đoạn chính:
+
+1. **Feature Engineering (Streaming)** — Trích xuất đặc trưng từ dữ liệu lưu lượng lớn (CSV hoặc NetFlow).  
+2. **Model Training (PyTorch)** — Huấn luyện mô hình phân loại DDoS dựa trên đặc trưng đã xử lý.  
+3. **Prediction & Scoring** — Áp dụng mô hình đã huấn luyện để phát hiện tấn công trong dữ liệu mới.
+
+## **2. Project Structure**
+.
+├── ddos.py # Xử lý & tạo đặc trưng từ dữ liệu thô (streaming)
+├── train_torch.py # Huấn luyện mô hình DDoS detection bằng PyTorch
+├── predict_torch.py # Dự đoán và gắn nhãn cảnh báo DDoS
+├── ddos_torch_model.pth # (sinh ra sau khi train) — state_dict của model
+├── feature_meta.pkl # (sinh ra sau khi train) — metadata (danh sách features)
+├── scaler.pkl # (sinh ra sau khi train) — scaler đã fit (StandardScaler)
+└── README.md
+
+## **3. Feature Engineering — ddos.py**
+### **Phần 1 — Header, docstring và imports**
+```python
+{
+#!/usr/bin/env python3
+# ddos_stream.py
+"""
+Streaming feature engineering:
+- đọc CSV theo chunksize
+- tính window_start_ms từ FLOW_START_MILLISECONDS
+- aggregate theo (window_start_ms, IPV4_DST_ADDR) (mặc định by=dst)
+- giữ một dict buffer cho các window đang mở; flush các window đã "an toàn" (old) ra file CSV
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+import math
+from collections import Counter, defaultdict
+import sys
+}
+
+###**Giải thích**
+#!/usr/bin/env python3 — shebang để chạy script bằng Python3 trên hệ thống Unix-like.
+Các comment và docstring mô tả mục tiêu chính: xử lý streaming, group theo window và IP, flush buffer ra file để tiết kiệm RAM.
+import các thư viện cần thiết:
++argparse để parse CLI arguments.
++pandas, numpy để xử lý dữ liệu.
++math cho toán học cơ bản.
++Counter, defaultdict cho thống kê và buffer.
++sys để in lỗi/truyền trạng thái.
+
+### **Phần 2 — Helper functions**
+```python
+{
+# ---------- helper functions (những hàm đơn giản) ----------
+def safe_div(a, b, eps=1e-9):
+    try: return a / b if b else a / (b + eps)
+    except: return 0.0
+
+def entropy_of_list(values):
+    if not values: return 0.0
+    c = Counter(values)
+    total = sum(c.values())
+    ent = 0.0
+    for v in c.values():
+        p = v / total
+        ent -= p * math.log2(p)
+    return ent
+
+def tcp_flag_ratios(vals_series):
+    if vals_series is None or len(vals_series)==0:
+        return 0.0,0.0,0.0,0.0
+    vals = vals_series.fillna(0).astype(int)
+    n = len(vals)
+    syn = ((vals & 0x02) != 0).sum() / n
+    ack = ((vals & 0x10) != 0).sum() / n
+    rst = ((vals & 0x04) != 0).sum() / n
+    fin = ((vals & 0x01) != 0).sum() / n
+    return syn, ack, rst, fin
+}
+
+###**Giải thích**
++safe_div(a,b,eps) — chia an toàn, tránh chia cho 0 bằng cách thêm eps khi b==0. Trả về 0.0 nếu có exception.
++entropy_of_list(values) — tính Shannon entropy của danh sách giá trị (dùng Counter để đếm tần suất, sau đó tính -Σ p log2 p), trả 0.0 nếu danh sách rỗng. Entropy dùng để ước lượng độ đa dạng (ví dụ: số lượng nguồn tấn công khác nhau).
++tcp_flag_ratios(vals_series) — với series các giá trị TCP_FLAGS (integer mask), lật từng bit để tính tỉ lệ các flag: SYN (0x02), ACK (0x10), RST (0x04), FIN (0x01). Trả tuple (syn, ack, rst, fin).
+
+### **Phần 3 — Hàm compute_features_from_group (tính feature cho một nhóm)**
+```python
+{
+
+def compute_features_from_group(grp, window_start_ms, by_key=None, by_type='dst'):
+    """
+    grp: DataFrame cho 1 nhóm (window, dst/src)
+    by_key: giá trị IP (dst_ip hoặc src_ip)
+    by_type: 'dst' hoặc 'src' hoặc 'global'
+    """
+    f = {}
+    f['window_start_ms'] = int(window_start_ms)
+
+    # ====== 1️⃣ Xác định hướng và tính in/out đúng nghĩa ======
+    if by_type == 'dst' and by_key is not None and 'IPV4_DST_ADDR' in grp.columns:
+        sub = grp[grp['IPV4_DST_ADDR'] == by_key]
+    elif by_type == 'src' and by_key is not None and 'IPV4_SRC_ADDR' in grp.columns:
+        sub = grp[grp['IPV4_SRC_ADDR'] == by_key]
+    else:
+        sub = grp
+
+    in_bytes = sub['IN_BYTES'].sum() if 'IN_BYTES' in sub.columns else 0
+    out_bytes = sub['OUT_BYTES'].sum() if 'OUT_BYTES' in sub.columns else 0
+    in_pkts = sub['IN_PKTS'].sum() if 'IN_PKTS' in sub.columns else 0
+    out_pkts = sub['OUT_PKTS'].sum() if 'OUT_PKTS' in sub.columns else 0
+
+    # ép về dương để tránh lỗi dữ liệu bất thường
+    in_bytes, out_bytes, in_pkts, out_pkts = map(abs, (in_bytes, out_bytes, in_pkts, out_pkts))
+
+    f['total_in_bytes'] = int(in_bytes)
+    f['total_out_bytes'] = int(out_bytes)
+    f['total_in_pkts'] = int(in_pkts)
+    f['total_out_pkts'] = int(out_pkts)
+
+    # ====== 2️⃣ Thông tin chung ======
+    f['num_flows'] = len(sub)
+    f['unique_src_ips'] = int(sub['IPV4_SRC_ADDR'].nunique()) if 'IPV4_SRC_ADDR' in sub.columns else 0
+    f['unique_src_ports'] = int(sub['L4_SRC_PORT'].nunique()) if 'L4_SRC_PORT' in sub.columns else 0
+
+    # ====== 3️⃣ Kích thước gói tin (theo bins) ======
+    bins_cols = ['NUM_PKTS_UP_TO_128_BYTES','NUM_PKTS_128_TO_256_BYTES','NUM_PKTS_256_TO_512_BYTES',
+                 'NUM_PKTS_512_TO_1024_BYTES','NUM_PKTS_1024_TO_1514_BYTES']
+    if all(c in sub.columns for c in bins_cols) and sub[bins_cols].sum().sum()>0:
+        s = sub[bins_cols].sum()
+        total = s.sum()
+        for c in bins_cols:
+            f[c] = float(s[c]/total) if total>0 else 0.0
+    else:
+        pkt_counts = (sub.get('IN_PKTS',0) + sub.get('OUT_PKTS',0)).replace(0, np.nan)
+        bytes_comb = sub.get('IN_BYTES',0) + sub.get('OUT_BYTES',0)
+        avg_pkt = (bytes_comb / pkt_counts).replace([np.inf, -np.inf], np.nan).dropna().values if len(sub)>0 else []
+        if len(avg_pkt)==0:
+            for c in bins_cols: f[c]=0.0
+        else:
+            f[bins_cols[0]] = float((avg_pkt<=128).mean())
+            f[bins_cols[1]] = float(((avg_pkt>128)&(avg_pkt<=256)).mean())
+            f[bins_cols[2]] = float(((avg_pkt>256)&(avg_pkt<=512)).mean())
+            f[bins_cols[3]] = float(((avg_pkt>512)&(avg_pkt<=1024)).mean())
+            f[bins_cols[4]] = float((avg_pkt>1024).mean())
+
+    # ====== 4️⃣ TCP flags ratios ======
+    syn,ack,rst,fin = tcp_flag_ratios(sub['TCP_FLAGS']) if 'TCP_FLAGS' in sub.columns else (0,0,0,0)
+    f['syn_ratio']=syn; f['ack_ratio']=ack; f['rst_ratio']=rst; f['fin_ratio']=fin
+
+    # ====== 5️⃣ Retransmit & entropy ======
+    f['retransmit_in_pkts'] = int(sub['RETRANSMITTED_IN_PKTS'].sum()) if 'RETRANSMITTED_IN_PKTS' in sub.columns else 0
+    f['src_ip_entropy'] = entropy_of_list(sub['IPV4_SRC_ADDR'].dropna().tolist()) if 'IPV4_SRC_ADDR' in sub.columns else 0.0
+
+    # ====== 6️⃣ Label ======
+    if 'Attack_DoS' in sub.columns:
+        f['label_dos'] = int(sub['Attack_DoS'].sum() > 0)
+    else:
+        f['label_dos'] = 0
+
+    # ====== 7️⃣ Gán IP ======
+    if by_type in ('dst', 'src') and by_key is not None:
+        f[f"{by_type}_ip"] = by_key
+
+    return f
+}
+
+###**Giải thích**
++ Hàm nhận grp (DataFrame cho một nhóm — ví dụ tất cả flow trong một window cho một dst IP), window_start_ms, by_key (IP) và by_type.
++ Lọc sub để chỉ giữ dòng liên quan đến by_key nếu cần (dst/src).
++ Tính tổng bytes/pkts in/out, ép về dương để xử lý dữ liệu nhiễu.
++ Tính các thống kê chung: num_flows, unique_src_ips, unique_src_ports.
++ Tính phân bố kích thước gói theo bins: nếu có cột bins sẵn thì dùng, nếu không ước lượng từ avg_pkt.
++ Dùng tcp_flag_ratios để tính tỉ lệ các TCP flags.
++ retransmit_in_pkts tổng các gói retransmit nếu cột có mặt.
++ src_ip_entropy dùng entropy để đo độ đa dạng nguồn.
++ label_dos được gán nếu trường Attack_DoS có trong dữ liệu.
++ Cuối cùng trả về dict f chứa các feature.
+
+### **Phần 4 — Streaming aggregator: stream_aggregate**
+```python
+{
+# ---------- streaming aggregator ----------
+def stream_aggregate(infile, outfile, window_sec=60, by='dst', chunksize=100000):
+    ms = window_sec * 1000
+    # buffer: { (window_start_ms, dst_ip) : list_of_rows_as_df_parts }
+    buffer = defaultdict(list)
+    # track smallest window we've seen and flush threshold
+    min_seen_window = None
+    out_written_header = False
+
+    for chunk in pd.read_csv(infile, chunksize=chunksize):
+        # ensure FLOW_START_MILLISECONDS numeric
+        if 'FLOW_START_MILLISECONDS' not in chunk.columns:
+            print("Input file lacks FLOW_START_MILLISECONDS column", file=sys.stderr)
+            return
+        chunk['FLOW_START_MILLISECONDS'] = pd.to_numeric(chunk['FLOW_START_MILLISECONDS'], errors='coerce').fillna(0).astype(int)
+        chunk['window_start_ms'] = (chunk['FLOW_START_MILLISECONDS'] // ms) * ms
+
+        # group chunk by window and dst (or global)
+        if by == 'dst' and 'IPV4_DST_ADDR' in chunk.columns:
+            grp_iter = chunk.groupby(['window_start_ms', 'IPV4_DST_ADDR'])
+        elif by == 'src' and 'IPV4_SRC_ADDR' in chunk.columns:
+            grp_iter = chunk.groupby(['window_start_ms', 'IPV4_SRC_ADDR'])
+        else:
+            grp_iter = chunk.groupby(['window_start_ms'])
+
+        # add to buffer
+        for key, g in grp_iter:
+            buffer[key].append(g)
+            # update min_seen_window
+            w = key if isinstance(key, int) else key[0]
+            if min_seen_window is None or w < min_seen_window:
+                min_seen_window = w
+
+        # flush windows that are older than current max window - 2 windows (safety)
+        # compute current max window in buffer
+        windows = [k[0] if isinstance(k, tuple) else k for k in buffer.keys()]
+        if not windows:
+            continue
+        max_window = max(windows)
+        # flush windows with window <= max_window - 2*ms
+        flush_threshold = max_window - 2*ms
+        # build list of keys to flush (use list() to avoid runtime-changes during iteration)
+        to_flush = [k for k in list(buffer.keys()) if (k[0] if isinstance(k, tuple) else k) <= flush_threshold]
+        rows_out = []
+        for k in to_flush:
+            # concat parts
+            parts = buffer.pop(k)
+            grp_df = pd.concat(parts, ignore_index=True)
+            # determine window_ts for feature fn
+            window_ts = k[0] if isinstance(k, tuple) else k
+            # compute features; pass by_key and by_type so compute function can pick correct sub-rows
+            by_key = k[1] if isinstance(k, tuple) else None
+            feat = compute_features_from_group(grp_df, window_ts, by_key=by_key, by_type=by)
+            rows_out.append(feat)
+
+        if rows_out:
+            outdf = pd.DataFrame(rows_out)
+            # append to outfile
+            if not out_written_header:
+                outdf.to_csv(outfile, index=False, mode='w')
+                out_written_header = True
+            else:
+                outdf.to_csv(outfile, index=False, mode='a', header=False)
+
+    # after streaming done, flush remaining buffer
+    if buffer:
+        rows_out = []
+        for k, parts in buffer.items():
+            grp_df = pd.concat(parts, ignore_index=True)
+            window_ts = k[0] if isinstance(k, tuple) else k
+            feat = compute_features_from_group(grp_df, window_ts)
+            if isinstance(k, tuple) and by in ('dst','src'):
+                if by=='dst':
+                    feat['dst_ip'] = k[1]
+                else:
+                    feat['src_ip'] = k[1]
+            rows_out.append(feat)
+        outdf = pd.DataFrame(rows_out)
+        if not out_written_header:
+            outdf.to_csv(outfile, index=False, mode='w')
+        else:
+            outdf.to_csv(outfile, index=False, mode='a', header=False)
+
+    print("Streaming aggregation complete. Output:", outfile)
+}
+###**Giải thích**
++ stream_aggregate đọc CSV theo chunksize (pandas).
++ Tính window_start_ms dựa trên FLOW_START_MILLISECONDS (floor division).
++ grp_iter: group theo (window_start_ms, IP) hoặc chỉ window_start_ms tuỳ by.
++ buffer lưu các phần DataFrame cho mỗi key (window, ip) để sau này concat. Buffer tránh giữ quá nhiều dữ liệu hiện thời.
++ Cơ chế flush: tìm max_window hiện có, thiết lập flush_threshold = max_window - 2*ms → flush các windows cũ hơn để đảm bảo đã nhận đủ bản ghi cho window đó (safety margin 2 windows).
++ Khi flush, concat(parts) → compute_features_from_group → lưu kết quả vào CSV (viết header lần đầu, append lần sau).
++ Khi stream kết thúc, flush hết phần còn lại và in thông báo hoàn thành.
+
+### **Phần 5 — CLI entrypoint**
+```python
+{
+# ---------- CLI ----------
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--input','-i', required=True)
+    p.add_argument('--out','-o', default='features_stream.csv')
+    p.add_argument('--window','-w', type=int, default=60)
+    p.add_argument('--by','-b', choices=['global','dst','src'], default='dst')
+    p.add_argument('--chunksize','-c', type=int, default=100000)
+    args = p.parse_args()
+    stream_aggregate(args.input, args.out, window_sec=args.window, by=args.by, chunksize=args.chunksize)
+
+if __name__ == '__main__':
+    main()
+}
+###**Giải thích**
++ Dùng argparse khai báo CLI: --input/-i (bắt buộc), --out, --window, --by, --chunksize.
++ Gọi stream_aggregate với các tham số đã parse.
++ Kiểm soát entrypoint chuẩn Python: if __name__ == '__main__': main().
+
+## **Model Training — train_torch.py**
+### **Phần 1 — Imports & configuration**
+```python
+{
+# train_torch_save.py
+import pandas as pd, numpy as np, joblib, torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+
+# --- config ---
+INFILE = "features_dst.csv"   # đổi nếu tên khác
+LABEL = "label_dos"
+MODEL_OUT = "ddos_torch_model.pth"
+META_OUT  = "feature_meta.pkl"
+SCALER_OUT= "scaler.pkl"
+EPOCHS = 30
+BATCH = 32
+LR = 1e-3
+
+}
+
+###**Giải thích**
+#!/usr/bin/env python3 — shebang để chạy script bằng Python3 trên hệ thống Unix-like.
+Các comment và docstring mô tả mục tiêu chính: xử lý streaming, group theo window và IP, flush buffer ra file để tiết kiệm RAM.
+import các thư viện cần thiết:
++ Import pandas/numpy/joblib/torch và các module sklearn để xử lý dữ liệu, scaler, split, và đánh giá.
++ Các biến config: tên file input, label column, đường dẫn lưu model/scaler/meta, hyperparams EPOCHS, BATCH, LR.
+### **Phần 2 — Load data & select features**
+```python
+{
+# --- load ---
+df = pd.read_csv(INFILE)
+# select numeric features except label and ip columns
+num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+if LABEL in num_cols:
+    num_cols.remove(LABEL)
+num_cols = [c for c in num_cols if c not in ('dst_ip','src_ip')]
+X = df[num_cols].fillna(0).values
+y = df[LABEL].astype(int).values
+
+print("Using", len(num_cols), "features.")
+
+}
+
+###**Giải thích**
++safe_div(a,b,eps) — chia an toàn, tránh chia cho 0 bằng cách thêm eps khi b==0. Trả về 0.0 nếu có exception.
++entropy_of_list(values) — tính Shannon entropy của danh sách giá trị (dùng Counter để đếm tần suất, sau đó tính -Σ p log2 p), trả 0.0 nếu danh sách rỗng. Entropy dùng để ước lượng độ đa dạng (ví dụ: số lượng nguồn tấn công khác nhau).
++tcp_flag_ratios(vals_series) — với series các giá trị TCP_FLAGS (integer mask), lật từng bit để tính tỉ lệ các flag: SYN (0x02), ACK (0x10), RST (0x04), FIN (0x01). Trả tuple (syn, ack, rst, fin).
+
+### **Phần 3 — Lưu danh sách feature và fit scaler**
+```python
+{
+
+# save feature meta
+joblib.dump({'features': num_cols}, META_OUT)
+
+# scaler
+scaler = StandardScaler().fit(X)
+joblib.dump(scaler, SCALER_OUT)
+Xs = scaler.transform(X)
+
+}
+
+###**Giải thích**
++ joblib.dump({'features': num_cols}, META_OUT) — lưu danh sách tên feature (và thứ tự) vào file .pkl. Rất quan trọng để predict_torch.py dùng đúng cùng thứ tự cột.
++ Fit StandardScaler trên X và lưu scaler bằng joblib. Xs là dữ liệu đã chuẩn hóa. Việc lưu scaler đảm bảo bước tiền xử lý consistent giữa train & predict.
+
+### **Phần 4 — Train/test split & DataLoader**
+```python
+{
+# split
+X_train, X_test, y_train, y_test = train_test_split(Xs, y, test_size=0.2, random_state=42,
+                                                    stratify=y if len(np.unique(y))>1 else None)
+
+# tensors & loader
+Xtr = torch.tensor(X_train, dtype=torch.float32)
+ytr = torch.tensor(y_train, dtype=torch.float32).view(-1,1)
+Xte = torch.tensor(X_test, dtype=torch.float32)
+yte = torch.tensor(y_test, dtype=torch.float32).view(-1,1)
+train_loader = DataLoader(TensorDataset(Xtr,ytr), batch_size=BATCH, shuffle=True)
+
+}
+###**Giải thích**
++ train_test_split chia dữ liệu theo test_size=0.2; nếu y có >1 class thì dùng stratify để giữ tỷ lệ classes.
++ Chuyển mảng numpy sang torch.tensor với dtype float32. y reshape thành dạng (N,1) để phù hợp BCELoss và output shape.
++ Tạo DataLoader cho training với batch size định nghĩa.
+
+### **Phần 5 — Định nghĩa model, optimizer, loss**
+```python
+{
+# model
+class DDoSNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim,256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256,128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128,64),
+            nn.ReLU(),
+            nn.Linear(64,1),
+            nn.Sigmoid()
+        )
+    def forward(self,x): return self.net(x)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DDoSNet(Xtr.shape[1]).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=LR)
+crit = nn.BCELoss()
+
+}
+###**Giải thích**
++ DDoSNet là MLP (feedforward) theo kiến trúc trong file: 256 → 128 → 64 → 1 với ReLU và Dropout.
++ Cuối cùng Sigmoid trả xác suất trong [0,1].
++ Chọn device (CUDA nếu có).
++ opt là optimizer Adam; crit là Binary Cross-Entropy Loss (BCELoss).
+
+### **Phần 6 — Vòng train**
+```python
+{
+# train
+for e in range(EPOCHS):
+    model.train()
+    total_loss = 0.0
+    for xb,yb in train_loader:
+        xb,yb = xb.to(device), yb.to(device)
+        opt.zero_grad()
+        out = model(xb)
+        loss = crit(out, yb)
+        loss.backward()
+        opt.step()
+        total_loss += loss.item()
+    print(f"Epoch {e+1}/{EPOCHS} loss={total_loss/len(train_loader):.4f}")
+
+}
+###**Giải thích**
++ Với mỗi epoch:
+Bật mode train() để kích hoạt dropout.
+Lặp batch: đưa dữ liệu lên device, zero grad, forward, compute loss, backprop (loss.backward()), cập nhật tham số (opt.step()), cộng loss.
+In loss trung bình trên batch mỗi epoch.
+
+### **Phần 7 — Evaluation & lưu model**
+```python
+{
+# eval
+model.eval()
+with torch.no_grad():
+    preds = model(torch.tensor(X_test, dtype=torch.float32).to(device)).cpu().numpy().flatten()
+y_pred = (preds >= 0.5).astype(int)
+print("Classification report:")
+print(classification_report(y_test, y_pred, digits=4))
+print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+# save model
+torch.save(model.state_dict(), MODEL_OUT)
+print("Saved model:", MODEL_OUT)
+print("Saved meta:", META_OUT, "and scaler:", SCALER_OUT)
+
+}
+###**Giải thích**
++ model.eval() và torch.no_grad() để tắt gradient và dropout behavior inference.
++ Dự đoán trên X_test, threshold 0.5 để lấy nhãn.
++ In classification_report và confusion_matrix để đánh giá hiệu năng.
++ Lưu state_dict() (trọng số) vào MODEL_OUT. In thông báo file đã lưu.
+
+## **Prediction & Alerting — predict_torch.py**
+### **Phần 1 — Header & config**
+```python
+{
+#!/usr/bin/env python3
+# predict_torch.py
+# Dự đoán DDoS sử dụng mô hình PyTorch đã huấn luyện
+
+import torch
+import joblib
+import pandas as pd
+import numpy as np
+import sys
+import os
+import torch.nn as nn
+
+# ================= CONFIG =================
+MODEL_FILE = "ddos_torch_model.pth"       # model đã train
+META_FILE = "feature_meta.pkl"            # chứa danh sách features
+SCALER_FILE = "scaler.pkl"                # scaler khi train
+IN_FILE = "features_dst.csv"              # file features cần dự đoán
+OUT_FILE = "features_with_preds.csv"      # file kết quả dự đoán
+THRESHOLD = 0.5                           # ngưỡng cảnh báo DDoS
+# ==========================================
+
+}
+
+###**Giải thích**
++ Shebang và comment mục đích file.
++ Import các thư viện cần: torch, joblib, pandas, numpy, sys, os.
++ Cấu hình mặc định: đường dẫn model/meta/scaler/input/output và threshold
+
+### **Phần 2 — Load feature meta**
+```python
+{
+# ----- Kiểm tra file meta -----
+if not os.path.exists(META_FILE):
+    print("Không tìm thấy file feature_meta.pkl — cần file này để biết danh sách features.")
+    sys.exit(1)
+
+meta = joblib.load(META_FILE)
+features = meta.get("features", None)
+if features is None or not isinstance(features, list):
+    print("feature_meta.pkl không chứa key 'features' hợp lệ.")
+    sys.exit(1)
+
+input_dim = len(features)
+print(f"Loaded {input_dim} features từ meta: {features[:5]} ...")
+
+}
+
+###**Giải thích**
++ Kiểm tra tồn tại feature_meta.pkl. Nếu không có thì dừng (vì cần để biết danh sách và thứ tự features).
++ joblib.load load dict {'features': num_cols} đã lưu lúc train. Lấy features và tính input_dim.
+
+### **Phần 3 — Load scaler**
+```python
+{
+# ----- Load scaler -----
+if os.path.exists(SCALER_FILE):
+    scaler = joblib.load(SCALER_FILE)
+    print("Loaded scaler từ", SCALER_FILE)
+else:
+    scaler = None
+    print("Không tìm thấy scaler. Kết quả có thể không chính xác do dữ liệu chưa chuẩn hóa.")
+
+}
+
+###**Giải thích**
++ Nếu scaler.pkl tồn tại thì load để chuẩn hóa dữ liệu theo cùng quy chuẩn lúc train. Nếu không có, script sẽ dùng chuẩn hóa tạm thời sau này (không khuyến nghị).
+
+### **Phần 4 — Định nghĩa model (phải trùng kiến trúc với train)**
+```python
+{
+# ----- Định nghĩa model -----
+class DDoSNet(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid()  # đảm bảo đầu ra [0, 1]
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DDoSNet(input_dim).to(device)
+
+}
+###**Giải thích**
++ Định nghĩa class DDoSNet với cùng kiến trúc như lúc train. Việc này cần thiết để load state_dict vào model mới tạo.
++ Chọn device và khởi tạo model trên device đó.
+
+### **Phần 5 — Load model weights**
+```python
+{
+# ----- Load model -----
+if not os.path.exists(MODEL_FILE):
+    print("Không tìm thấy file model:", MODEL_FILE)
+    sys.exit(1)
+
+state = torch.load(MODEL_FILE, map_location=device)
+try:
+    model.load_state_dict(state)
+    print("Model weights loaded successfully.")
+except Exception as e:
+    print("Lỗi khi load state_dict:", e)
+    if isinstance(state, dict):
+        for k in ("state_dict", "model_state_dict", "model_state"):
+            if k in state:
+                model.load_state_dict(state[k])
+                print("Loaded từ key:", k)
+                break
+        else:
+            print("Không thể load model. Dừng.")
+            sys.exit(1)
+    else:
+        sys.exit(1)
+
+model.eval()
+
+}
+###**Giải thích**
++ Kiểm tra file model tồn tại.
++ torch.load(..., map_location=device) để load state dict trên CPU/GPU tương ứng.
++ Thử model.load_state_dict(state) trực tiếp; nếu state là dict chứa key khác (ví dụ state['state_dict']), script cố gắng tìm các key phổ biến rồi load. Nếu không thể load thì exit.
++ Gọi model.eval() để đặt model vào chế độ inference.
+
+### **Phần 6 — Đọc file input & kiểm tra features**
+```python
+{
+# ----- Đọc file input -----
+if not os.path.exists(IN_FILE):
+    print("Không tìm thấy file input:", IN_FILE)
+    sys.exit(1)
+
+df = pd.read_csv(IN_FILE)
+missing = [f for f in features if f not in df.columns]
+if missing:
+    print("Thiếu các cột sau trong file input:", missing)
+    sys.exit(1)
+
+}
+
+###**Giải thích**
++ Kiểm tra IN_FILE tồn tại.
++ Đọc CSV vào DataFrame df.
++ Kiểm tra xem tất cả features đã lưu lúc train có trong df; nếu thiếu cột nào thì exit để tránh sai lệch thứ tự/features.
+### **Phần 7 — Chuẩn bị dữ liệu & predict**
+```python
+{
+# ----- Chuẩn bị dữ liệu -----
+X = df[features].select_dtypes(include=[np.number]).fillna(0).values
+if scaler is not None:
+    X = scaler.transform(X)
+else:
+    print("Không có scaler, chuẩn hóa tạm thời.")
+    X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-9)
+
+X_tensor = torch.tensor(X, dtype=torch.float32).to(device)
+
+# ----- Dự đoán -----
+with torch.no_grad():
+    probs = model(X_tensor).cpu().numpy().flatten()
+
+# ----- Kiểm tra và chuẩn hóa đầu ra -----
+if np.any(probs < 0) or np.any(probs > 1):
+    print("Có giá trị ddos_score nằm ngoài [0,1]! Sửa bằng sigmoid.")
+    probs = 1 / (1 + np.exp(-probs))
+
+probs = np.clip(probs, 0, 1)
+
+}
+
+###**Giải thích**
++ Lấy df[features], đảm bảo chỉ numeric (select_dtypes) và fillna(0).
++ Nếu có scaler, áp scaler.transform; nếu không, chuẩn hóa tạm thời bằng z-score bản thân dữ liệu (không khuyến nghị cho deploy).
++ Chuyển sang torch.tensor và dùng model để predict với torch.no_grad() (tắt gradient).
++ Kiểm tra đầu ra probs nằm trong [0,1]; nếu không, áp sigmoid rồi clip.
+### **Phần 8 — Gán kết quả, in tóm tắt & lưu**
+```python
+{
+# ----- Gán kết quả -----
+df["ddos_score"] = probs
+df["ddos_alert"] = (df["ddos_score"] >= THRESHOLD).astype(int)
+
+# ----- Thống kê & xuất kết quả -----
+total = len(df)
+alerts = df[df["ddos_alert"] == 1]
+print(f"\nTổng số dòng: {total}")
+print(f"Số dòng cảnh báo DDoS: {len(alerts)} (ngưỡng ≥ {THRESHOLD})")
+
+if not alerts.empty:
+    print("\nTop 10 cảnh báo đầu tiên:")
+    print(alerts[["ddos_score", "ddos_alert"]].head(10).to_string(index=False))
+else:
+    print("Không phát hiện dòng nào vượt ngưỡng DDoS.")
+
+# ----- Ghi file kết quả -----
+df.to_csv(OUT_FILE, index=False)
+print(f"\nKết quả đã lưu vào: {OUT_FILE}")
+
+}
+
+###**Giải thích**
++ Tạo hai cột mới: ddos_score (xác suất) và ddos_alert (0/1 theo THRESHOLD).
++ In tóm tắt tổng số dòng và số cảnh báo. Nếu có cảnh báo, in top 10.
++ Lưu DataFrame ra CSV OUT_FILE.
 
