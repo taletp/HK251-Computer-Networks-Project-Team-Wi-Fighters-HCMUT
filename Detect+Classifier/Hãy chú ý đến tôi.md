@@ -17,9 +17,13 @@ Chúng tôi đã tham khảo về bài viết A Novel Two-Stage Deep Learning Mo
 | **Độ phức tạp triển khai**          | Trung bình (đa module nhưng chủ yếu rule-based)                              | Cao (deep learning, cần GPU và nhiều dữ liệu)                                                                      | ⚠️ Cần training trước, nhưng inference nhanh nên phù hợp nếu kết hợp với hệ thống sẵn có          |
 | **Khả năng mở rộng & tích hợp**     | Có thể tích hợp thêm mô hình AI trong Detection Engine                       | Dễ đóng gói mô hình LSTM-AE thành module (Python Flask API hoặc TensorFlow Serving)                                | ✅ Dễ tích hợp dưới dạng microservice gọi REST API                                                 |
 
+
+<img width="1260" height="752" alt="image" src="https://github.com/user-attachments/assets/45359a4a-b3ec-4e9d-b457-af320ff9ae5c" />
+
+
 Dưới đây là phần mã giả về các step mà chúng tôi sẽ hiện thực:
 
-Stage 1 – Data Preprocessing:
+### Stage 1 – Data Preprocessing:
 
 
 FUNCTION preprocess_data(input_file):
@@ -54,8 +58,53 @@ FUNCTION preprocess_data(input_file):
 
 -----------------------------------------------------------------------------------------
 
-   Mục đích của stage này là dùng để xử lý dữ liệu ( làm sạch và chuẩn hóa)
-<img width="1260" height="752" alt="image" src="https://github.com/user-attachments/assets/45359a4a-b3ec-4e9d-b457-af320ff9ae5c" />
+
+#### 1 Mục tiêu tổng quát
+
+Biến dữ liệu thô → “Clean & Ready”: không còn thiếu/khác thang đo/hỗn tạp kiểu dữ liệu.
+
+Giảm nhiễu, giảm trùng lặp, chuẩn hóa về cùng thang để mô hình học ổn định, hội tụ nhanh.
+
+Tách được bộ train/test chuẩn để đánh giá khách quan.
+
+
+#### 2 Các bước xử lý :
+
+a. Xử lý thiếu dữ liệu – Missing Data Handling
+b. Mã hóa biến phân loại – Categorical Encoding
+c. Chuẩn hóa giá trị số – Normalization/Scaling
+d. Loại bỏ/giữ lại đặc trưng – Feature Dropping/Selection
+e. Tách đặc trưng & nhãn – X / y split
+f. Chia tập train/test (và có thể validation)
+
+#### 3 Input & output
+
+Input: 
+
+Output:  [X_train, y_train, X_test, y_test, scaler, encoder, schema]
+Lý do output có format như này:
+- Phù hợp trực tiếp cho Stage 2 (LSTM-AE + Softmax):
+Model chỉ cần nhận X_* đã chuẩn hoá → train/predict ngay, không phải xử lý lại.
+
+- Đảm bảo tái lập (reproducibility):
+Cùng một scaler/encoder/schema → dữ liệu inference sẽ khớp tuyệt đối với lúc training.
+
+- Đánh giá khách quan:
+Có X_test, y_test riêng → đo Accuracy/Recall/F1/FAR đúng chuẩn.
+
+- Dễ mở rộng real-time:
+Về sau, module đọc stream chỉ cần áp cùng scaler/encoder cho mỗi batch/cửa sổ, rồi đẩy thẳng sang model.
+
+Tóm tắt:
+| Thành phần         | Dạng dữ liệu                 | Mục đích sử dụng trong Stage 2            |
+| ------------------ | ---------------------------- | ----------------------------------------- |
+| `X_train`          | Ma trận đặc trưng huấn luyện | Huấn luyện Encoder/Decoder LSTM-AE        |
+| `y_train`          | Vector/ma trận nhãn          | Dạy classifier (Softmax layer)            |
+| `X_test`, `y_test` | Tập kiểm thử                 | Đánh giá Accuracy, Recall, F1, FAR        |
+| `scaler.pkl`       | Bộ chuẩn hóa đã fit          | Áp dụng lại cho dữ liệu mới khi phát hiện |
+| `encoder.pkl`      | Bộ mã hóa one-hot            | Dùng lại khi encode online                |
+| `features.json`    | Danh sách cột                | Đảm bảo thứ tự đầu vào nhất quán          |
+
 
 
    
